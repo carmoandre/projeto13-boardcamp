@@ -36,6 +36,12 @@ const customersSchema = joi.object({
     birthday: joi.date().less("now"),
 });
 
+const rentalsSchema = joi.object({
+    customerId: joi.number(),
+    gameId: joi.number(),
+    daysRented: joi.number().greater(0),
+});
+
 /* Categories Routes*/
 server.get("/categories", async (req, res) => {
     try {
@@ -104,7 +110,6 @@ server.get("/games", async (req, res) => {
 
 server.post("/games", async (req, res) => {
     const validation = gamesSchema.validate(req.body);
-    console.log(validation);
     const existentCategory = await connection.query(
         `SELECT * FROM games WHERE id=$1`,
         [req.body.categoryId]
@@ -172,7 +177,6 @@ server.get("/customers/:id", async (req, res) => {
 
 server.post("/customers", async (req, res) => {
     const validation = customersSchema.validate(req.body);
-    console.log(validation);
     if (validation.error) {
         res.sendStatus(400);
         return;
@@ -239,6 +243,153 @@ server.delete("/customers/:id", async (req, res) => {
     }
 });
 */
+
+/* Rentals Routes*/
+server.get("/rentals", async (req, res) => {
+    const { customerId, gameId } = req.query;
+    let selectionAttachment = "";
+    const selectParams = [];
+    if (customerId) {
+        selectParams.push(customerId);
+        selectionAttachment = `WHERE rentals."customerId"=$1`;
+    }
+    if (gameId) {
+        selectParams.push(gameId);
+        selectionAttachment = `WHERE rentals."gameId"=$1`;
+    }
+    if (selectParams.length === 2) {
+        selectionAttachment = `WHERE rentals."customerId"=$1 AND rentals."gameId"=$2`;
+    }
+
+    try {
+        const rentals = await connection.query(
+            `SELECT rentals.*, 
+            jsonb_build_object('name', customers.name, 'id', customers.id) AS customer,
+            jsonb_build_object('id', games.id, 'name', games.name, 'categoryId', games."categoryId", 'categoryName', categories.name) AS game            
+            FROM rentals 
+            JOIN customers ON rentals."customerId" = customers.id
+            JOIN games ON rentals."gameId" = games.id
+            JOIN categories ON categories.id = games."categoryId"
+            ${selectionAttachment}
+            ORDER BY id`,
+            selectParams
+        );
+        res.send(rentals.rows);
+    } catch (err) {
+        console.log(err);
+        res.sendStatus(400);
+    }
+});
+
+server.post("/rentals", async (req, res) => {
+    const validation = rentalsSchema.validate(req.body);
+    const { customerId, gameId, daysRented } = req.body;
+    const existentCustomer = await connection.query(
+        `SELECT * FROM customers WHERE id=$1`,
+        [customerId]
+    );
+
+    const existentGame = await connection.query(
+        `SELECT * FROM games WHERE id=$1`,
+        [gameId]
+    );
+
+    const existentRentals = await connection.query(
+        `SELECT * FROM rentals WHERE "gameId"=$1 AND "returnDate" IS NULL`,
+        [gameId]
+    );
+
+    if (
+        validation.error ||
+        !existentCustomer.rows.length ||
+        !existentGame.rows.length ||
+        existentRentals.rows.length >= existentGame.rows[0].stockTotal
+    ) {
+        res.sendStatus(400);
+        return;
+    }
+
+    try {
+        await connection.query(
+            `INSERT INTO rentals ("customerId", "gameId", "rentDate", "daysRented", "returnDate", "originalPrice", "delayFee") VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [
+                customerId,
+                gameId,
+                "NOW()",
+                daysRented,
+                null,
+                daysRented * existentGame.rows[0].pricePerDay,
+                null,
+            ]
+        );
+        res.sendStatus(201);
+    } catch (err) {
+        console.log(err);
+        res.status(400).send("Erro ao tentar criar o registro de aluguel");
+    }
+});
+
+server.post("/rentals/:id/return", async (req, res) => {
+    const { id } = req.params;
+    const existentRental = await connection.query(
+        `SELECT * FROM rentals WHERE id=$1`,
+        [id]
+    );
+
+    if (!existentRental.rows.length) {
+        res.status(404).send("Não foi encontrado um aluguel com esse ID");
+        return;
+    }
+
+    if (existentRental.rows[0].returnDate !== null) {
+        res.status(400).send("Aluguel já finalizado");
+        return;
+    }
+    const game = await connection.query(`SELECT * FROM games WHERE id=$1`, [
+        existentRental.rows[0].gameId,
+    ]);
+
+    const delayDaysTimestamp =
+        (Date.now() - Date.parse(existentRental.rows[0].rentDate)) /
+        (1000 * 3600 * 24);
+    const delayFee = Math.floor(delayDaysTimestamp) * game.rows[0].pricePerDay;
+
+    try {
+        await connection.query(
+            `UPDATE rentals SET "returnDate"=$1, "delayFee"=$2 WHERE id=$3`,
+            ["NOW()", delayFee, id]
+        );
+        res.sendStatus(200);
+    } catch (err) {
+        console.log(err);
+        res.sendStatus(400);
+    }
+});
+
+server.delete("/rentals/:id", async (req, res) => {
+    const { id } = req.params;
+    const existentRental = await connection.query(
+        `SELECT * FROM rentals WHERE id=$1`,
+        [id]
+    );
+    if (!existentRental.rows.length) {
+        res.sendStatus(404);
+        return;
+    }
+    if (existentRental.rows.returnDate) {
+        res.status(400).send(
+            "O registro de aluguel não pode ser excluído pois já foi finalizado"
+        );
+        return;
+    }
+    try {
+        connection.query(`DELETE FROM rentals WHERE id=$1`, [id]);
+        res.sendStatus(200);
+    } catch (err) {
+        console.log(err);
+        res.status(400).send("Erro ao tentar excluir o registro de aluguel");
+    }
+});
 
 server.listen(4000, () => {
     console.log("Server listening on port 4000.");
